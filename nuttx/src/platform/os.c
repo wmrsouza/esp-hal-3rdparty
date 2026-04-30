@@ -13,6 +13,7 @@
 
 #include <debug.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -219,7 +220,7 @@ static esp_err_t esp_os_queue_send_generic(esp_os_queue_handle_t queue,
   struct timespec timeout;
   FAR struct mq_adpt *mq_adpt = (FAR struct mq_adpt *)queue;
 
-  if (ticks == OS_PORT_MAX_DELAY || ticks == 0)
+  if (ticks == OS_PORT_MAX_DELAY)
     {
       ret = file_mq_send(&mq_adpt->mq, (FAR const char *)item,
                          mq_adpt->msgsize, prio);
@@ -234,7 +235,7 @@ static esp_err_t esp_os_queue_send_generic(esp_os_queue_handle_t queue,
       if (ret < 0)
         {
           _err("Failed to get time\n");
-          return false;
+          return ESP_FAIL;
         }
 
       if (ticks)
@@ -311,7 +312,7 @@ static esp_err_t esp_os_queue_receive_generic(esp_os_queue_handle_t queue,
       if (ret < 0)
         {
           _err("Failed to get time\n");
-          return false;
+          return ESP_FAIL;
         }
 
       if (ticks)
@@ -633,28 +634,37 @@ esp_err_t esp_os_queue_receive_from_isr(esp_os_queue_handle_t queue,
                                         FAR void *item, FAR void *hptw)
 {
   esp_err_t ret;
-  int flags;
+  int orig_flags;
+  int rc;
 
-  flags = file_fcntl(&queue->mq, F_GETFL);
-  if ((flags & O_NONBLOCK) == 0)
+  orig_flags = file_fcntl(&queue->mq, F_GETFL);
+  if (orig_flags < 0)
     {
-      if (file_fcntl(&queue->mq, F_SETFL, flags | O_NONBLOCK) == -1)
+      _err("Failed to get mq flags\n");
+      return ESP_FAIL;
+    }
+
+  if ((orig_flags & O_NONBLOCK) == 0)
+    {
+      rc = file_fcntl(&queue->mq, F_SETFL, orig_flags | O_NONBLOCK);
+      if (rc < 0)
         {
           _err("Failed to set nonblock flag\n");
           return ESP_FAIL;
         }
     }
 
-  *(FAR int *)hptw = 0;
+  if (hptw != NULL)
+    {
+      *(FAR int *)hptw = 0;
+    }
 
   ret = esp_os_queue_receive_generic(queue, item, 0);
 
-  /* Restore the original flags. */
-
-  flags = file_fcntl(&queue->mq, F_GETFL);
-  if (file_fcntl(&queue->mq, F_SETFL, flags & ~O_NONBLOCK) == -1)
+  rc = file_fcntl(&queue->mq, F_SETFL, orig_flags);
+  if (rc < 0)
     {
-      _err("Failed to clear nonblock flag\n");
+      _err("Failed to restore mq flags\n");
       return ESP_FAIL;
     }
 
@@ -695,6 +705,146 @@ void esp_os_queue_delete_with_caps(esp_os_queue_handle_t queue)
 void esp_os_queue_delete(esp_os_queue_handle_t queue)
 {
   esp_os_queue_delete_with_caps(queue);
+}
+
+/****************************************************************************
+ * Name: esp_os_queue_reset
+ *
+ * Description:
+ *   Discard all elements waitin on a queue.
+ *
+ * Input Parameters:
+ *   queue - Queue handle.
+ *
+ ****************************************************************************/
+
+void esp_os_queue_reset(esp_os_queue_handle_t queue)
+{
+  struct mq_attr attr;
+  char *item;
+  int flags;
+
+  if (file_mq_getattr(&queue->mq, &attr))
+    {
+      _err("Failed to get queue attributes\n");
+      return;
+    }
+
+  item = kmm_malloc(attr.mq_msgsize);
+  if (item == NULL)
+    {
+      _err("Failed to alloc item buffer\n");
+      return;
+    }
+
+  flags = file_fcntl(&queue->mq, F_GETFL);
+  if ((flags & O_NONBLOCK) == 0)
+    {
+      if (file_fcntl(&queue->mq, F_SETFL, flags | O_NONBLOCK) == -1)
+        {
+          _err("Failed to set nonblock flag\n");
+          kmm_free(item);
+          return;
+        }
+    }
+
+  /* Empty the queue */
+
+  while (esp_os_queue_receive_generic(queue, item, 0) == ESP_OK);
+
+  if ((flags & O_NONBLOCK) == 0)
+    {
+
+  /* Restore the original flags. */
+
+      if (file_fcntl(&queue->mq, F_SETFL, flags) == -1)
+        {
+          _err("Failed to clear nonblock flag\n");
+        }
+    }
+
+  kmm_free(item);
+}
+
+/****************************************************************************
+ * Name: esp_os_queue_messages_waiting
+ *
+ * Description:
+ *   Return the number of messages waiting in a queue.
+ *
+ * Input Parameters:
+ *   queue - Queue handle.
+ *
+ * Returned Value:
+ *   The number of messages waiting in a queue.
+ *
+ ****************************************************************************/
+
+uint32_t esp_os_queue_messages_waiting(esp_os_queue_handle_t queue)
+{
+  struct mq_attr attr;
+
+  if (file_mq_getattr(&queue->mq, &attr))
+    {
+      _err("Failed to get queue attributes\n");
+      return 0;
+    }
+
+  return (uint32_t)attr.mq_curmsgs;
+}
+
+/****************************************************************************
+ * Name: esp_os_queue_spaces_available
+ *
+ * Description:
+ *   Return the number of spaces available in a queue.
+ *
+ * Input Parameters:
+ *   queue - Queue handle.
+ *
+ * Returned Value:
+ *   The number of spaces available in a queue.
+ *
+ ****************************************************************************/
+
+uint32_t esp_os_queue_spaces_available(esp_os_queue_handle_t queue)
+{
+  struct mq_attr attr;
+
+  if (file_mq_getattr(&queue->mq, &attr))
+    {
+      _err("Failed to get queue attributes\n");
+      return 0;
+    }
+
+  return (uint32_t)(attr.mq_maxmsg - attr.mq_curmsgs);
+}
+
+/****************************************************************************
+ * Name: esp_os_queue_is_full_from_isr
+ *
+ * Description:
+ *   Test whether a queue is full (ISR-safe snapshot).
+ *
+ * Input Parameters:
+ *   queue - Queue handle.
+ *
+ * Returned Value:
+ *   True if the queue has no free slots (mq_curmsgs == mq_maxmsg).
+ *
+ ****************************************************************************/
+
+bool esp_os_queue_is_full_from_isr(esp_os_queue_handle_t queue)
+{
+  struct mq_attr attr;
+
+  if (file_mq_getattr(&queue->mq, &attr))
+    {
+      _err("Failed to get queue attributes\n");
+      return true;
+    }
+
+  return (attr.mq_curmsgs == attr.mq_maxmsg);
 }
 
 /****************************************************************************
@@ -854,6 +1004,120 @@ int esp_os_unlock_mutex(FAR esp_os_mutex_t *mutex)
 void esp_os_delete_mutex(FAR esp_os_mutex_t *mutex)
 {
   nxmutex_destroy(mutex);
+}
+
+/****************************************************************************
+ * Name: esp_os_create_semaphore
+ *
+ * Description:
+ *   Initialize a non-recursive semaphore.
+ *
+ * Input Parameters:
+ *   sema - Pointer to the semaphore to initialize.
+ *
+ ****************************************************************************/
+
+void esp_os_create_semaphore(FAR esp_os_semaphore_t *sema)
+{
+  sem_init(sema, 0, 0);
+}
+
+/****************************************************************************
+ * Name: esp_os_create_binary_semaphore
+ *
+ * Description:
+ *   Initialize a non-recursive binary semaphore.
+ *
+ * Input Parameters:
+ *   sema - Pointer to the binary semaphore to initialize.
+ *
+ ****************************************************************************/
+
+void esp_os_create_binary_semaphore(FAR esp_os_semaphore_t *sema)
+{
+  esp_os_create_semaphore(sema);
+}
+
+/****************************************************************************
+ * Name: esp_os_take_semaphore
+ *
+ * Description:
+ *   Attempt to lock a non-recursive semaphore, blocking up to timeout_ms
+ *   milliseconds.  A timeout_ms value of UINT32_MAX blocks indefinitely.
+ *
+ * Input Parameters:
+ *   sema       - Pointer to the semaphore to take.
+ *   timeout_ms - Maximum time (in milliseconds) to wait for the semaphore.
+ *
+ * Returned Value:
+ *   0 on success, a negative value if the semaphore could not be locked before
+ *   the timeout expired.
+ *
+ ****************************************************************************/
+
+int esp_os_take_semaphore(FAR esp_os_semaphore_t *sema, uint32_t timeout_ms)
+{
+  struct timespec abstime;
+  struct timespec rel;
+  int ret;
+
+  if (timeout_ms == 0)
+    {
+      return sem_trywait(sema);
+    }
+
+  if (timeout_ms == UINT32_MAX)
+    {
+      return sem_wait(sema);
+    }
+
+  ret = clock_gettime(CLOCK_REALTIME, &abstime);
+  if (ret < 0)
+    {
+      return -EINVAL;
+    }
+
+  rel.tv_sec  = (time_t)(timeout_ms / 1000);
+  rel.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
+  clock_timespec_add(&abstime, &rel, &abstime);
+
+  return sem_timedwait(sema, &abstime);
+}
+
+/****************************************************************************
+ * Name: esp_os_give_semaphore
+ *
+ * Description:
+ *   Unlocks a non-recursive semaphore.
+ *
+ * Input Parameters:
+ *   sema - Pointer to the semaphore to unlock.
+ *
+ * Returned Value:
+ *   0 on success, or a negative value on failure.
+ *
+ ****************************************************************************/
+
+int esp_os_give_semaphore(FAR esp_os_semaphore_t *sema)
+{
+  return sem_post(sema);
+}
+
+/****************************************************************************
+ * Name: esp_os_delete_semaphore
+ *
+ * Description:
+ *   Destroy a non-recursive semaphore previously initialized with
+ *   esp_os_create_semaphore() or esp_os_create_binary_semaphore().
+ *
+ * Input Parameters:
+ *   sema - Pointer to the semaphore to destroy.
+ *
+ ****************************************************************************/
+
+void esp_os_delete_semaphore(FAR esp_os_semaphore_t *sema)
+{
+  sem_destroy(sema);
 }
 
 /****************************************************************************

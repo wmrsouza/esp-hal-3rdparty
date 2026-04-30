@@ -149,6 +149,7 @@ typedef uint32_t esp_os_tick_type_t;
 typedef intr_handler_t esp_os_intr_handler_t;
 typedef rmutex_t esp_os_recursive_mutex_t;
 typedef mutex_t esp_os_mutex_t;
+typedef sem_t esp_os_semaphore_t;
 
 /* Task management types */
 
@@ -167,6 +168,8 @@ typedef struct esp_os_task_notify_s esp_os_task_notify_t;
 
 #define pdPASS  0
 #define portMAX_DELAY 0xfffffffful
+
+#define portYIELD_FROM_ISR()  do { } while (0)
 
 #ifdef CONFIG_SMP
 #  define portNUM_PROCESSORS CONFIG_SMP_NCPUS
@@ -252,6 +255,14 @@ void esp_os_queue_delete_with_caps(esp_os_queue_handle_t queue);
 
 void esp_os_queue_delete(esp_os_queue_handle_t queue);
 
+void esp_os_queue_reset(esp_os_queue_handle_t queue);
+
+uint32_t esp_os_queue_messages_waiting(esp_os_queue_handle_t queue);
+
+uint32_t esp_os_queue_spaces_available(esp_os_queue_handle_t queue);
+
+bool esp_os_queue_is_full_from_isr(esp_os_queue_handle_t queue);
+
 /* Recursive mutex functions */
 
 void esp_os_create_recursive_mutex(FAR esp_os_recursive_mutex_t *mutex);
@@ -272,6 +283,18 @@ int  esp_os_lock_mutex_timeout(FAR esp_os_mutex_t *mutex,
 int esp_os_unlock_mutex(FAR esp_os_mutex_t *mutex);
 
 void esp_os_delete_mutex(FAR esp_os_mutex_t *mutex);
+
+/* Non-recursive semaphore functions (with millisecond timeout on take) */
+
+void esp_os_create_semaphore(FAR esp_os_semaphore_t *sema);
+
+void esp_os_create_binary_semaphore(FAR esp_os_semaphore_t *sema);
+
+int esp_os_take_semaphore(FAR esp_os_semaphore_t *sema, uint32_t timeout_ms);
+
+int esp_os_give_semaphore(FAR esp_os_semaphore_t *sema);
+
+void esp_os_delete_semaphore(FAR esp_os_semaphore_t *sema);
 
 /* Scheduler control functions */
 
